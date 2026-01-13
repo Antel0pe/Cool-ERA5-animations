@@ -29,11 +29,11 @@ from dotenv import load_dotenv
 # ----------------------------
 # Constants you change up top
 # ----------------------------
-GRIB_FILENAME = "t2m_2020_hourly.grib"  # file name under DATA_DIR_BASE
+GRIB_FILENAME = "2020_hourly_10mWind_2mTemp_sst.grib"  # file name under DATA_DIR_BASE
 ENV_PATH = ".env"                      # will be loaded if present
-DATA_DIR_ENVVAR = "DATA_DIR_BASE"      # env var name for base path holding the GRIB
+DATA_DIR_ENVVAR = "ERA5_CACHE_DIR"      # env var name for base path holding the GRIB
 OUT_DIR = Path("./images")
-VIDEO_PATH = Path("./t2m_2020_30fps.mp4")
+VIDEO_PATH = Path("./test_outputs/t2m_2020_30fps.mp4")
 FPS = 30
 
 # Temperature-to-color scale (Kelvin). Adjust if you want a different range.
@@ -117,7 +117,7 @@ def open_t2m_dataset(grib_path: Path) -> xr.DataArray:
     """
     # cfgrib can sometimes split variables into multiple "datasets".
     # We open the file and try common ways to locate 2m temperature.
-    ds = xr.open_dataset(grib_path, engine="cfgrib")
+    ds = xr.open_dataset(grib_path, engine="cfgrib", backend_kwargs={"indexpath": str(grib_path) + ".idx"})
 
     # Try common variable names for ERA5 GRIB.
     for name in ("t2m", "2t", "t"):
