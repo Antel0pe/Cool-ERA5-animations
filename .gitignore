@@ -1,4 +1,5 @@
 test_outputs/
+mask_outputs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
