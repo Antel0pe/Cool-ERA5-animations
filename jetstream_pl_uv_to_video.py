@@ -1,32 +1,28 @@
-# jetstream_pl_uv_to_video_efficient.py
-# Reads 4 ERA5 pressure-level NetCDFs (200/225/250/300 hPa) containing u/v,
-# computes wind speed per level, picks the dominant level per pixel (streaming, no (L,H,W) stack),
-# then encodes:
-#   Hue  = dominant level (fixed palette)
-#   Value/Brightness = dominant speed mapped from MIN_SPEED..MAX_SPEED
-#   Saturation = fixed
+# jetstream_pl_uv_to_video_efficient_shared200225300.py
 #
-# Perf/RAM changes vs original:
-# - No np.stack((L,H,W)) per frame: streaming argmax across levels
-# - open_dataset with chunks={"time": 1}, cache=False, explicit engine
-# - keep only u/v variables (drop everything else)
-# - minimize copies: float32, astype(copy=False), in-place sqrt
+# Uses ONE NetCDF that contains 200/225/300 hPa (with a pressure_level dim),
+# plus your old separate 250 hPa file.
+#
+# Shared file:
+#   ./era5_2020_JanFeb_uv_200-225-300hPa_hourly_nc/data_stream-oper_stepType-instant.nc
+# Separate 250 file:
+#   250hpa_uv_2020.nc
 #
 # Output:
-#   (A) write one RGBA frame per hour to ./jetstream_pl_images
-#   (B) stream frames directly into an .mp4 via ffmpeg (no PNGs written)
+#   streams RGBA frames into ffmpeg (or writes PNGs if STREAM_TO_VIDEO=False)
 
 from __future__ import annotations
 
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import xarray as xr
 from PIL import Image
 from dotenv import load_dotenv  # optional
+import time
 
 
 # ----------------------------
@@ -35,12 +31,10 @@ from dotenv import load_dotenv  # optional
 
 DATA_DIR_ENV = "ERA5_CACHE_DIR"
 
-FILES_BY_LEVEL_HPA: Dict[int, str] = {
-    200: "era5_uv_pl_2020_H1_200hPa_0p25.nc",
-    225: "era5_uv_pl_2020_H1_225hPa_0p25.nc",
-    250: "250hpa_uv_2020.nc",
-    300: "era5_uv_pl_2020_H1_300hPa_0p25.nc",
-}
+SHARED_200_225_300_FILE = "era5_2020_JanFeb_uv_200-225-300hPa_hourly_nc/data_stream-oper_stepType-instant.nc"
+FILE_250 = "250hpa_uv_2020.nc"
+
+LEVELS_HPA = [200, 225, 250, 300]
 
 U_NAME = "u"
 V_NAME = "v"
@@ -67,21 +61,34 @@ LOG_EVERY_N = 168  # ~weekly
 # ----------------------------
 # Helpers
 # ----------------------------
+# Optional: increase netCDF4 chunk cache so sequential hourly reads
+# reuse decoded chunks instead of thrashing.
+try:
+    import netCDF4
+    # (size_bytes, nelems, preemption)
+    # size_bytes: total cache size; 512MB here is a good starting point.
+    netCDF4.set_chunk_cache(512 * 1024 * 1024 * 6, 1_000_000, 0.75)
+    print("netCDF4 chunk cache set to 512MB")
+except Exception as e:
+    print(f"netCDF4 chunk cache not set ({e})")
 
-def resolve_input_paths() -> Dict[int, Path]:
+
+def resolve_input_paths() -> Tuple[Path, Path]:
     load_dotenv()
     base = os.environ.get(DATA_DIR_ENV)
     if not base:
         raise EnvironmentError(f"Env var {DATA_DIR_ENV} is not set.")
     basep = Path(base)
 
-    out: Dict[int, Path] = {}
-    for lvl, fn in FILES_BY_LEVEL_HPA.items():
-        p = basep / fn
-        if not p.exists():
-            raise FileNotFoundError(f"Input NetCDF not found for {lvl} hPa: {p}")
-        out[lvl] = p
-    return out
+    shared = basep / SHARED_200_225_300_FILE
+    p250 = basep / FILE_250
+
+    if not shared.exists():
+        raise FileNotFoundError(f"Shared NetCDF not found: {shared}")
+    if not p250.exists():
+        raise FileNotFoundError(f"250 hPa NetCDF not found: {p250}")
+
+    return shared, p250
 
 
 def find_coord_name(ds: xr.Dataset, candidates: tuple[str, ...]) -> str:
@@ -107,7 +114,7 @@ def find_time_name(ds: xr.Dataset) -> str:
 
 
 def find_level_name(ds: xr.Dataset) -> str | None:
-    for name in ("pressure_level", "plev", "level", "isobaricInhPa"):
+    for name in ("pressure_level", "plev", "level", "isobaricInhPa", "pressure"):
         if name in ds.dims or name in ds.coords:
             return name
     return None
@@ -209,21 +216,13 @@ def normalize_speed_to_value(speed: np.ndarray, min_speed: float, max_speed: flo
     return np.clip(t, 0.0, 1.0)
 
 
-def load_level_dataset(path: Path) -> xr.Dataset:
-    """
-    Perf/RAM:
-    - chunks={'time': 1} to read one timestep at a time lazily
-    - cache=False to avoid holding decoded arrays in memory
-    - select only u/v to drop other vars immediately
-    """
+def open_minimal_ds(path: Path, engine: str = "netcdf4") -> xr.Dataset:
     ds = xr.open_dataset(
         path,
-        engine="netcdf4",      # try "h5netcdf" if it benchmarks faster for your files
+        engine=engine,
         decode_times=True,
-        chunks={"time": 1},
-        cache=False,
+        cache=True,
     )
-
     missing = [vn for vn in (U_NAME, V_NAME) if vn not in ds.variables]
     if missing:
         raise KeyError(f"{path.name}: missing variables {missing}. Vars: {list(ds.variables)}")
@@ -233,58 +232,92 @@ def load_level_dataset(path: Path) -> xr.Dataset:
     return ds
 
 
+def select_level_if_present(da: xr.DataArray, ds: xr.Dataset, target_level_hpa: int) -> xr.DataArray:
+    lvl_name = find_level_name(ds)
+    if lvl_name is None or (lvl_name not in da.dims):
+        return da
+
+    coord = ds[lvl_name].values.astype(np.float64)
+
+    # Decide whether coord is in Pa or hPa by magnitude
+    # (Pa levels are typically 20000..100000; hPa levels are 200..1000)
+    target = float(target_level_hpa)
+    if np.nanmax(coord) > 2000.0:
+        target = target * 100.0  # hPa -> Pa
+
+    # Prefer exact match; if missing, use nearest (safe when only one level exists)
+    try:
+        return da.sel(**{lvl_name: target})
+    except Exception:
+        return da.sel(**{lvl_name: target}, method="nearest")
+
+
+def normalize_time_and_chunk(ds: xr.Dataset) -> xr.Dataset:
+    time_name = find_time_name(ds)
+    if time_name != "time":
+        ds = ds.rename({time_name: "time"})
+    # Now that the dim is definitely "time", chunk time=1
+    # ds = ds.chunk({"time": 1})
+    return ds
+
+
 # ----------------------------
 # Main
 # ----------------------------
 
 def main() -> None:
-    paths = resolve_input_paths()
-    out_dir = Path("./jetstream_pl_images")
+    shared_path, p250_path = resolve_input_paths()
 
-    levels = sorted(paths.keys())
+    # Open shared ds once + open 250 ds separately
+    ds_shared = open_minimal_ds(shared_path)
+    ds_250 = open_minimal_ds(p250_path)
 
-    # Open datasets (lazy, chunked, minimal vars)
-    dsets: Dict[int, xr.Dataset] = {lvl: load_level_dataset(paths[lvl]) for lvl in levels}
+    # Normalize time name + chunking
+    ds_shared = normalize_time_and_chunk(ds_shared)
+    ds_250 = normalize_time_and_chunk(ds_250)
 
-    # Determine lat orientation using one dataset
-    ds0 = dsets[levels[0]]
+    # Lat orientation from one dataset (shared preferred)
+    ds0 = ds_shared
     lat_name = find_coord_name(ds0, ("latitude", "lat"))
     lat_vals = ds0[lat_name].values
     lat_ascending = bool(lat_vals[0] < lat_vals[-1])
 
-    # Slice time & normalize dims/names per level, keep as dask-backed arrays
+    # Build per-level u/v views (all lazy, chunked time=1)
     u_by_level: Dict[int, xr.DataArray] = {}
     v_by_level: Dict[int, xr.DataArray] = {}
 
-    for lvl in levels:
-        ds = dsets[lvl]
-        time_name = find_time_name(ds)
+    for lvl in LEVELS_HPA:
+        if lvl in (200, 225, 300):
+            ds = ds_shared
+        elif lvl == 250:
+            ds = ds_250
+        else:
+            raise ValueError(f"Unexpected level {lvl}")
 
-        u = ds[U_NAME].sel(**{time_name: slice(START_TIME, END_TIME)})
-        v = ds[V_NAME].sel(**{time_name: slice(START_TIME, END_TIME)})
+        u = ds[U_NAME].sel(time=slice(START_TIME, END_TIME))
+        v = ds[V_NAME].sel(time=slice(START_TIME, END_TIME))
 
-        # normalize time coordinate name
-        if time_name != "time":
-            u = u.rename({time_name: "time"})
-            v = v.rename({time_name: "time"})
+        # If this file still has a level dim, pick the requested level
+        u = select_level_if_present(u, ds, lvl)
+        v = select_level_if_present(v, ds, lvl)
 
-        # squeeze level dim if present and size==1
-        level_name = find_level_name(ds)
-        if level_name is not None and level_name in u.dims and u.sizes.get(level_name, 0) == 1:
-            u = u.isel(**{level_name: 0})
-            v = v.isel(**{level_name: 0})
+        # If level dim remains but is size 1, squeeze it away
+        lvl_name = find_level_name(ds)
+        if lvl_name is not None and lvl_name in u.dims and u.sizes.get(lvl_name, 0) == 1:
+            u = u.isel(**{lvl_name: 0})
+            v = v.isel(**{lvl_name: 0})
 
         u_by_level[lvl] = u
         v_by_level[lvl] = v
 
-    # Reference times
-    ref_lvl = levels[0]
+    # Reference time axis (from 200 if present, else first)
+    ref_lvl = 200 if 200 in u_by_level else LEVELS_HPA[0]
     times = u_by_level[ref_lvl]["time"].values
     if len(times) == 0:
         raise ValueError("No timesteps found in the requested time range.")
 
-    # Ensure time alignment across levels
-    for lvl in levels:
+    # Ensure time alignment across all levels
+    for lvl in LEVELS_HPA:
         u = u_by_level[lvl]
         v = v_by_level[lvl]
         if u.sizes.get("time") != v.sizes.get("time"):
@@ -294,10 +327,6 @@ def main() -> None:
         if not np.array_equal(u["time"].values, times):
             raise ValueError(f"{lvl} hPa: time coords differ from reference {ref_lvl} hPa.")
 
-    # Initialize IO targets and per-frame working buffers
-    ffmpeg_proc = None
-    ffmpeg_stdin = None
-
     # Determine shape from one timestep (forces only one chunk read)
     u0 = u_by_level[ref_lvl].isel(time=0).values
     v0 = v_by_level[ref_lvl].isel(time=0).values
@@ -305,15 +334,16 @@ def main() -> None:
         raise ValueError(f"Expected 2D (lat,lon); got {u0.shape} and {v0.shape}")
     h, w = u0.shape
 
-    # Precompute hue list
+    levels = sorted(LEVELS_HPA)
     hues = np.array([level_to_hue(lvl) for lvl in levels], dtype=np.float32)
-
-    # Precompute constant saturation field once
     s_field = np.full((h, w), float(FIXED_SATURATION), dtype=np.float32)
 
-    # Pre-allocate streaming argmax buffers once
     best_speed = np.empty((h, w), dtype=np.float32)
     best_idx = np.empty((h, w), dtype=np.uint8)
+
+    out_dir = Path("./jetstream_pl_images")
+    ffmpeg_proc = None
+    ffmpeg_stdin = None
 
     if STREAM_TO_VIDEO:
         h2 = h - (h % 2)
@@ -324,53 +354,57 @@ def main() -> None:
         ffmpeg_stdin = ffmpeg_proc.stdin
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
+        
+    t_loop_start = time.perf_counter()
+
+    acc_level = 0.0     # u/v load + speed + argmax
+    acc_render = 0.0    # hsv + flip + encode
 
     for i, t in enumerate(times):
-        # Streaming dominant-level selection: no (L,H,W) stack
         best_speed.fill(-np.inf)
         best_idx.fill(0)
-
+        
+        print('before levels loop')
         for li, lvl in enumerate(levels):
-            # Pull one time slice; keep float32 with minimal copying
             uu = u_by_level[lvl].isel(time=i).values.astype(np.float32, copy=False)
             vv = v_by_level[lvl].isel(time=i).values.astype(np.float32, copy=False)
 
-            # speed = sqrt(u^2 + v^2) with minimal temporaries
             sp = uu * uu
             sp += vv * vv
-            np.sqrt(sp, out=sp)  # reuse sp as speed
+            np.sqrt(sp, out=sp)
 
             m = sp > best_speed
             if np.any(m):
                 best_speed[m] = sp[m]
                 best_idx[m] = li
+            print('finished iter ', lvl)
+        print('done levels loop')
 
-        dom_speed = best_speed  # (H,W) float32
+        dom_speed = best_speed
         dom_idx = best_idx.astype(np.int32, copy=False)
 
-        h_field = hues[dom_idx]  # (H,W) float32
-
+        h_field = hues[dom_idx]
         v_field = normalize_speed_to_value(dom_speed, MIN_SPEED, MAX_SPEED)
+        print('normalized speed')
 
         if ALPHA_BELOW_MIN:
             a_field = (dom_speed >= MIN_SPEED).astype(np.float32, copy=False)
         else:
             a_field = np.ones_like(v_field, dtype=np.float32)
 
-        # NaNs -> transparent
+        print('after alpha b4 min')
         nan_mask = ~np.isfinite(dom_speed)
         if np.any(nan_mask):
-            a_field = a_field.copy()  # only copy if we need to edit
+            a_field = a_field.copy()
             v_field = v_field.copy()
             a_field[nan_mask] = 0.0
             v_field[nan_mask] = 0.0
-
+        print('before hsv')
         rgba = hsv_to_rgba(h_field, s_field, v_field, a_field)
 
-        # Flip to make north-up if latitude ascending (-90..90)
         if lat_ascending:
             rgba = np.flipud(rgba)
-
+        print('after flip')
         if STREAM_TO_VIDEO:
             rgba = even_crop_rgba(rgba)
             ffmpeg_stdin.write(rgba.tobytes())
@@ -379,14 +413,13 @@ def main() -> None:
             ts = np.datetime_as_string(t, unit="s").replace(":", "").replace("-", "")
             out_path = out_dir / f"frame_{i:05d}_{ts}.{IMG_EXT}"
             img.save(out_path)
-
+        print('after frame')
         if (i % LOG_EVERY_N) == 0:
             if STREAM_TO_VIDEO:
                 print(f"[{i:05d}/{len(times)-1:05d}] streamed frame {i:05d}")
             else:
                 print(f"[{i:05d}/{len(times)-1:05d}] wrote {out_path.name}")
 
-    # Close ffmpeg / finalize
     if STREAM_TO_VIDEO:
         assert ffmpeg_proc is not None and ffmpeg_stdin is not None
         ffmpeg_stdin.close()
@@ -397,9 +430,8 @@ def main() -> None:
     else:
         print(f"Done. Wrote {len(times)} frames to: {out_dir.resolve()}")
 
-    # Close datasets explicitly (avoid lingering file handles)
-    for ds in dsets.values():
-        ds.close()
+    ds_shared.close()
+    ds_250.close()
 
 
 if __name__ == "__main__":
